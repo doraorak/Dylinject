@@ -2,9 +2,22 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!--
+	  Deliberately NO entitlements.
+
+	  csrutil disable already grants root task_for_pid, so task_for_pid-allow
+	  buys nothing here — and on an ad-hoc signature it makes AMFI SIGKILL the
+	  binary at exec (rc=137, before main runs). Same for the private
+	  thread-set-state / cs.debugger / system-task-ports set.
+
+	  Verified on macOS 27.0 (26A5388g) with EMPTY boot-args and library
+	  validation left at its default: unentitled ad-hoc dylinject injects into
+	  a plain binary, into /bin/sleep (a platform binary), and into launchd
+	  itself; a freshly spawned cupsd then comes up with the loader mapped.
+
+	  If you add an entitlement here, expect rc=137 and no injection.
+	-->
 	<key>com.apple.security.app-sandbox</key>
 	<false/>
-	<key>com.apple.security.get-task-allow</key>
-	<true/>
 </dict>
 </plist>

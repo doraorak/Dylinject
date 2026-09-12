@@ -13,6 +13,7 @@
 #include <stdio.h>
 
 #include <ptrauth.h>
+#include <libproc.h>
 kern_return_t (*_thread_convert_thread_state)(thread_act_t thread, int direction, thread_state_flavor_t flavor, thread_state_t in_state, mach_msg_type_number_t in_stateCnt, thread_state_t out_state, mach_msg_type_number_t *out_stateCnt);
 
 static char shell_code[] =
@@ -96,7 +97,10 @@ static char shell_code[] =
 int main(int argc, char **argv)
 {
         
-    int result = 0;
+    // Failure until the remote thread reports the magic back. This was 0, and
+    // the poll loop below falls through without touching it, so every timeout
+    // was reported as a successful injection.
+    int result = 1;
     mach_port_t task = 0;
     thread_act_t thread = 0;
     mach_vm_address_t code = 0;
@@ -106,12 +110,53 @@ int main(int argc, char **argv)
     pid_t pid = 0;
     
     if (argc < 3) {
-        printf("Usage: %s <path> <pid>\n", argv[0]);
+        printf("Usage: %s <path> <pid> [expected-exec-path]\n", argv[0]);
         return 1;
     }
     
     const char *payload_path = argv[1];
     pid = atoi(argv[2]);
+    
+    // Optional third argument: wait until the target is actually running the
+    // image we expect before touching it.
+    //
+    // This exists because of POSIX_SPAWN_SETEXEC. xpcproxy becomes the real
+    // daemon in place, keeping its pid, so whoever asks for the injection knows
+    // the pid before the image exists. Injecting into the pid in that window
+    // would land in xpcproxy, or in the middle of its exec. Polling
+    // proc_pidpath until it matches is what makes this safe -- a fixed sleep
+    // would only make the race less likely.
+    if (argc >= 4) {
+        const char *expected = argv[3];
+        char current[PROC_PIDPATHINFO_MAXSIZE];
+        int matched = 0;
+        for (int i = 0; i < 200; i++) {                 // ~2s at 10ms
+            if (proc_pidpath(pid, current, sizeof(current)) > 0 &&
+                strcmp(current, expected) == 0) {
+                matched = 1;
+                break;
+            }
+            usleep(10000);
+        }
+        if (!matched) {
+            fprintf(stderr, "pid %d never became %s; not injecting\n", pid, expected);
+            return 1;
+        }
+        // The image is mapped, but its initializers may still be running.
+        usleep(30000);
+    }
+    
+    // Checked here, before anything reaches into the target: the path is copied
+    // into a fixed tail of the shellcode, and a longer one used to walk off the
+    // end of the array. Validating input first also means the failure is
+    // reproducible without a live process to inject.
+    const size_t kPathOffset = 168;
+    const size_t path_room = sizeof(shell_code) - kPathOffset - 1;   // keep the NUL
+    if (strlen(payload_path) > path_room) {
+        fprintf(stderr, "payload path is too long: %zu bytes, room for %zu\n",
+                strlen(payload_path), path_room);
+        return 1;
+    }
     
     if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) {
         fprintf(stderr, "could not retrieve task port for pid: %d\n", pid);
@@ -143,7 +188,7 @@ int main(int argc, char **argv)
     
     memcpy(shell_code + 88, &pcfmt_address, sizeof(uint64_t));
     memcpy(shell_code + 160, &dlopen_address, sizeof(uint64_t));
-    memcpy(shell_code + 168, payload_path, strlen(payload_path));
+    memcpy(shell_code + kPathOffset, payload_path, strlen(payload_path));
     
     if (mach_vm_write(task, code, (vm_address_t) shell_code, sizeof(shell_code)) != KERN_SUCCESS) {
         fprintf(stderr, "could not copy shellcode into code segment\n");
@@ -233,12 +278,16 @@ terminate:
     if (error != KERN_SUCCESS) {
         fprintf(stderr, "failed to terminate remote thread: %s\n", mach_error_string(error));
     }
-    else {
-        //fprintf(stdout, "terminated remote thread\n");
-        exit(0);
+    
+    if (result != 0) {
+        fprintf(stderr, "dlopen did not report back within the poll window; "
+                        "the dylib may not be loaded in pid %d\n", pid);
     }
     
-    return result; 
+    // Whether the scaffolding thread could be torn down says nothing about
+    // whether the dylib loaded. Only `result` does, so only `result` is
+    // returned -- this used to exit(0) here and discard it.
+    return result;
 }
 
 
